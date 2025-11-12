@@ -209,7 +209,7 @@ class CodeBERTTrainer:
             logger.error(f"Error in pipeline: {e}")
             raise
 
-def main():
+def main(): 
     parser = argparse.ArgumentParser(description='Train CodeBERT on SemEval-2026-Task13')
     parser.add_argument('--task', choices=['A', 'B', 'C'], default='A', help='Task subset to use')
     parser.add_argument('--output_dir', default='./results', help='Output directory')
