@@ -16,6 +16,8 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, cla
 import argparse
 import logging
 import warnings
+import wandb
+wandb.init(project="semeval2613_train_baseline")
 warnings.filterwarnings("ignore")
 
 logging.basicConfig(level=logging.INFO)
@@ -63,14 +65,19 @@ class CodeBERTTrainer:
             logger.error(f"Error loading dataset: {e}")
             raise
     
-    def initialize_model_and_tokenizer(self):
+    def initialize_model_and_tokenizer(self, pretrained_path = None):
         logger.info(f"Initializing {self.model_name} model and tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=True)
 
+        model_name = self.model
+        if pretrained_path:
+            model_name = pretrained_path
+            
         self.model = RobertaForSequenceClassification.from_pretrained(
-            self.model_name,
+            model_name,
             num_labels=self.num_labels,
-            problem_type="single_label_classification"
+            problem_type="single_label_classification",
+            
         )
         logger.info(f"Model initialized with {self.num_labels} labels")
     
@@ -114,9 +121,39 @@ class CodeBERTTrainer:
     def compute_metrics(self, eval_pred):
         predictions, labels = eval_pred
         predictions = np.argmax(predictions, axis=1)
+
         accuracy = accuracy_score(labels, predictions)
-        precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average='weighted')
-        return {'accuracy': accuracy, 'f1': f1, 'precision': precision, 'recall': recall}
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            labels, predictions, average='weighted'
+        )
+
+        metrics = {
+            'accuracy': accuracy,
+            'f1': f1,
+            'precision': precision,
+            'recall': recall
+        }
+
+        try:
+            if torch.cuda.is_available():
+                dev = torch.cuda.current_device()
+                # Make sure all kernels finished before sampling memory
+                torch.cuda.synchronize(dev)
+
+                allocated_mb = torch.cuda.memory_allocated(dev) / (1024 ** 2)
+                reserved_mb  = torch.cuda.memory_reserved(dev)  / (1024 ** 2)
+                peak_mb      = torch.cuda.max_memory_allocated(dev) / (1024 ** 2)
+
+                metrics.update({
+                    'gpu_mem_allocated_mb': round(allocated_mb, 1),
+                    'gpu_mem_reserved_mb':  round(reserved_mb, 1),
+                    'gpu_peak_mem_mb':      round(peak_mb, 1),
+                })
+        except Exception as e:
+            logger.debug(f"GPU memory stats not available: {e}")
+
+        return metrics
+
     
     def train(self, train_dataset, val_dataset, output_dir="./results", num_epochs=3, batch_size=16, learning_rate=2e-5,
               dataloader_num_workers=None):   
@@ -137,7 +174,7 @@ class CodeBERTTrainer:
             weight_decay=0.01,
             logging_dir='./logs',
             logging_steps=100,
-            evaluation_strategy="steps",
+            eval_strategy="steps",
             eval_steps=500,
             save_strategy="steps",
             save_steps=500,
@@ -150,7 +187,8 @@ class CodeBERTTrainer:
             save_total_limit=2,
             dataloader_num_workers=dataloader_num_workers,     
             dataloader_pin_memory=True,                        
-            dataloader_persistent_workers=True                 
+            dataloader_persistent_workers=True,
+            report_to="wandb"            
             # dataloader_prefetch_factor=2,
         )
 
