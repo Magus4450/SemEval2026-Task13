@@ -1,3 +1,22 @@
+train-ppt:
+	@jobid=$$(sbatch --job-name=train-baseline \
+		--output=logs/train-baseline_%j.out \
+		run.slurm src.train_ppt train-adapters \
+		--out_ai models/lora_ai \
+		--out_human models/lora_human \
+		--bs 32 \
+		--grad_accum 4 \
+		--lr 2e-4 \
+		--load_in_8bit \
+		--max_length 768\
+		--epochs 2\
+		--warmup_ratio 0.05 | awk '{print $$4}'); \
+	echo "Submitted batch job $$jobid"; \
+	logfile=logs/train-baseline_$${jobid}.out; \
+	echo "Tailing $$logfile..."; \
+	while [ ! -f $$logfile ]; do sleep 1; done; \
+	tail -f $$logfile
+	
 train-baseline-B:
 	@jobid=$$(sbatch --job-name=train-baseline \
 		--output=logs/train-baseline_%j.out \

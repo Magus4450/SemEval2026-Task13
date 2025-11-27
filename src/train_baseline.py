@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class CodeBERTTrainer:
-    def __init__(self, task_subset='A', max_length=512, model_name="microsoft/codebert-base",
+    def __init__(self, task_subset='A', max_length=768, model_name="microsoft/codebert-base",
                  map_num_proc=None):      
         self.task_subset = task_subset
         self.max_length = max_length
@@ -253,6 +253,9 @@ def main():
     parser.add_argument('--loader_workers', type=int, default=None, help='DataLoader workers')            
     
     args = parser.parse_args()
+
+    print(args)
+    
     os.makedirs(args.output_dir, exist_ok=True)
 
     get_gpu_info()
