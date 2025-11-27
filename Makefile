@@ -21,14 +21,32 @@ train-baseline-B:
 	@jobid=$$(sbatch --job-name=train-baseline \
 		--output=logs/train-baseline_%j.out \
 		run.slurm src.train_baseline \
+		--model_name microsoft/unixcoder-base \
 		--task B \
 		--output_dir outputs/baseline_test \
 		--epochs 1 \
 		--batch_size 256 \
 		--learning_rate 2e-5 \
-		--max_length 512 | awk '{print $$4}'); \
+		--max_length 1024 | awk '{print $$4}'); \
 	echo "Submitted batch job $$jobid"; \
 	logfile=logs/train-baseline_$${jobid}.out; \
+	echo "Tailing $$logfile..."; \
+	while [ ! -f $$logfile ]; do sleep 1; done; \
+	tail -f $$logfile
+
+train-contrastive-B:
+	@jobid=$$(sbatch --job-name=train-contrastive \
+		--output=logs/train-contrastive_%j.out \
+		run.slurm src.train_contrastive \
+		--model_name microsoft/unixcoder-base \
+		--task B \
+		--output_dir outputs/contrastive \
+		--epochs 1 \
+		--batch_size 64 \
+		--learning_rate 2e-5 \
+		--max_length 512 | awk '{print $$4}'); \
+	echo "Submitted batch job $$jobid"; \
+	logfile=logs/train-contrastive_$${jobid}.out; \
 	echo "Tailing $$logfile..."; \
 	while [ ! -f $$logfile ]; do sleep 1; done; \
 	tail -f $$logfile

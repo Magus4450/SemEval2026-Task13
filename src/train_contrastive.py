@@ -1,38 +1,165 @@
 import os
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from datasets import load_dataset, Dataset
 from transformers import (
-    AutoTokenizer,                    # CHANGED: use fast tokenizer
-    RobertaForSequenceClassification,
+    AutoTokenizer,
+    AutoConfig,
+    RobertaModel,
+    RobertaPreTrainedModel,
     TrainingArguments,
     Trainer,
     EarlyStoppingCallback,
     DataCollatorWithPadding
 )
+from transformers.modeling_outputs import SequenceClassifierOutput
 from src.utils import get_gpu_info
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
 import argparse
 import logging
 import warnings
 import wandb
+
 wandb.init(project="semeval2613_train_baseline")
 warnings.filterwarnings("ignore")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+class ContrastiveCodeBERT(RobertaPreTrainedModel):
+    """
+    CodeBERT with contrastive learning for better feature separation
+    between human-written and AI-generated code.
+    """
+    def __init__(self, config, contrastive_weight=0.3, temperature=0.07):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.contrastive_weight = contrastive_weight
+        self.temperature = temperature
+        
+        self.roberta = RobertaModel(config, add_pooling_layer=False)
+        
+        # Projection head for contrastive learning
+        self.projection_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.ReLU(),
+            nn.Linear(config.hidden_size, 256)
+        )
+        
+        # Classification head
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        
+        self.post_init()
+    
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        labels=None,
+        return_dict=None,
+    ):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        
+        # Get CodeBERT embeddings
+        outputs = self.roberta(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+        )
+        
+        # Use [CLS] token representation
+        sequence_output = outputs[0][:, 0, :]
+        
+        # Classification
+        pooled_output = self.dropout(sequence_output)
+        logits = self.classifier(pooled_output)
+        
+        loss = None
+        if labels is not None:
+            # Standard cross-entropy loss
+            loss_fct = nn.CrossEntropyLoss()
+            classification_loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            
+            # Contrastive loss
+            if self.training and self.contrastive_weight > 0:
+                # Project embeddings for contrastive learning
+                projections = self.projection_head(sequence_output)
+                projections = F.normalize(projections, p=2, dim=1)
+                
+                contrastive_loss = self.supervised_contrastive_loss(
+                    projections, labels
+                )
+                
+                # Combined loss
+                loss = classification_loss + self.contrastive_weight * contrastive_loss
+            else:
+                loss = classification_loss
+        
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+        
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+    
+    def supervised_contrastive_loss(self, features, labels):
+        """
+        Supervised contrastive loss (SupCon).
+        Pulls together samples of the same class and pushes apart different classes.
+        """
+        batch_size = features.shape[0]
+        
+        # Compute similarity matrix
+        similarity_matrix = torch.matmul(features, features.T) / self.temperature
+        
+        # Create mask for positive pairs (same label)
+        labels = labels.contiguous().view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(features.device)
+        
+        # Mask out self-similarity
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size).view(-1, 1).to(features.device),
+            0
+        )
+        mask = mask * logits_mask
+        
+        # Compute log probabilities
+        exp_logits = torch.exp(similarity_matrix) * logits_mask
+        log_prob = similarity_matrix - torch.log(exp_logits.sum(1, keepdim=True))
+        
+        # Compute mean of log-likelihood over positive pairs
+        mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-8)
+        
+        # Loss is negative log-likelihood
+        loss = -mean_log_prob_pos.mean()
+        
+        return loss
+
+
 class CodeBERTTrainer:
     def __init__(self, task_subset='A', max_length=768, model_name="microsoft/codebert-base",
-                 map_num_proc=None):      
+                 map_num_proc=None, contrastive_weight=0.3, temperature=0.07):      
         self.task_subset = task_subset
         self.max_length = max_length
         self.model_name = model_name
         self.tokenizer = None
         self.model = None
         self.num_labels = None
-        self.map_num_proc = map_num_proc  
+        self.map_num_proc = map_num_proc
+        self.contrastive_weight = contrastive_weight
+        self.temperature = temperature
         
     def load_and_prepare_data(self):
         logger.info(f"Loading dataset subset {self.task_subset}...")
@@ -51,6 +178,15 @@ class CodeBERTTrainer:
             df['label'] = df['label'].astype(int)
             self.num_labels = df['label'].nunique()
 
+            num_label0 = (df['label'] == 0).sum()
+            print(f"Original label-0 count: {num_label0}")
+            keep_count = num_label0 // 2
+            df_label0 = df[df['label'] == 0]
+            df_label0_down = df_label0.sample(n=keep_count, random_state=42)
+            df_other = df[df['label'] != 0]
+            df = pd.concat([df_other, df_label0_down], ignore_index=True)
+            df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+
             logger.info(f"Number of unique labels: {self.num_labels}")
             logger.info(f"Label range: {df['label'].min()} to {df['label'].max()}")
             logger.info(f"Label distribution:\n{df['label'].value_counts().sort_index()}")
@@ -65,21 +201,26 @@ class CodeBERTTrainer:
             logger.error(f"Error loading dataset: {e}")
             raise
     
-    def initialize_model_and_tokenizer(self, pretrained_path = None):
-        logger.info(f"Initializing {self.model_name} model and tokenizer...")
+    def initialize_model_and_tokenizer(self, pretrained_path=None):
+        logger.info(f"Initializing {self.model_name} model and tokenizer with contrastive learning...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=True)
 
-        model_name = self.model
-        if pretrained_path:
-            model_name = pretrained_path
-            
-        self.model = RobertaForSequenceClassification.from_pretrained(
-            model_name,
-            num_labels=self.num_labels,
-            problem_type="single_label_classification",
-            
+        model_path = pretrained_path if pretrained_path else self.model_name
+        
+        # Load config
+        config = AutoConfig.from_pretrained(model_path)
+        config.num_labels = self.num_labels
+        
+        # Create contrastive model
+        self.model = ContrastiveCodeBERT.from_pretrained(
+            model_path,
+            config=config,
+            contrastive_weight=self.contrastive_weight,
+            temperature=self.temperature
         )
-        logger.info(f"Model initialized with {self.num_labels} labels")
+        
+        logger.info(f"Contrastive model initialized with {self.num_labels} labels")
+        logger.info(f"Contrastive weight: {self.contrastive_weight}, Temperature: {self.temperature}")
     
     def tokenize_function(self, examples):
         return self.tokenizer(
@@ -137,7 +278,6 @@ class CodeBERTTrainer:
         try:
             if torch.cuda.is_available():
                 dev = torch.cuda.current_device()
-                # Make sure all kernels finished before sampling memory
                 torch.cuda.synchronize(dev)
 
                 allocated_mb = torch.cuda.memory_allocated(dev) / (1024 ** 2)
@@ -189,7 +329,6 @@ class CodeBERTTrainer:
             dataloader_pin_memory=True,                        
             dataloader_persistent_workers=True,
             report_to="wandb"            
-            # dataloader_prefetch_factor=2,
         )
 
         data_collator = DataCollatorWithPadding(tokenizer=self.tokenizer)
@@ -241,17 +380,20 @@ class CodeBERTTrainer:
             logger.error(f"Error in pipeline: {e}")
             raise
 
+
 def main(): 
-    parser = argparse.ArgumentParser(description='Train CodeBERT on SemEval-2026-Task13')
+    parser = argparse.ArgumentParser(description='Train CodeBERT with Contrastive Learning on SemEval-2026-Task13')
     parser.add_argument('--model_name', default='microsoft/codebert-base', type=str, help='Name of the model')
     parser.add_argument('--task', choices=['A', 'B', 'C'], default='A', help='Task subset to use')
     parser.add_argument('--output_dir', default='./results', help='Output directory')
     parser.add_argument('--epochs', type=int, default=3, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size (increased for contrastive learning)')
     parser.add_argument('--learning_rate', type=float, default=2e-5, help='Learning rate')
-    parser.add_argument('--max_length', type=int, default=128, help='Maximum sequence length')
-    parser.add_argument('--map_num_proc', type=int, default=None, help='Workers for tokenization map()')  
-    parser.add_argument('--loader_workers', type=int, default=None, help='DataLoader workers')            
+    parser.add_argument('--max_length', type=int, default=512, help='Maximum sequence length')
+    parser.add_argument('--map_num_proc', type=int, default=24, help='Workers for tokenization map()')  
+    parser.add_argument('--loader_workers', type=int, default=None, help='DataLoader workers')
+    parser.add_argument('--contrastive_weight', type=float, default=0.3, help='Weight for contrastive loss')
+    parser.add_argument('--temperature', type=float, default=0.07, help='Temperature for contrastive learning')
     
     args = parser.parse_args()
 
@@ -264,7 +406,10 @@ def main():
     trainer = CodeBERTTrainer(
         task_subset=args.task,
         max_length=args.max_length,
-        map_num_proc=args.map_num_proc     
+        model_name=args.model_name,
+        map_num_proc=args.map_num_proc,
+        contrastive_weight=args.contrastive_weight,
+        temperature=args.temperature
     )
     
     trainer.run_full_pipeline(
@@ -274,6 +419,7 @@ def main():
         learning_rate=args.learning_rate,
         dataloader_num_workers=args.loader_workers  
     )
+
 
 if __name__ == "__main__":
     main()
