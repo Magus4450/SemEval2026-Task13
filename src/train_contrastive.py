@@ -18,11 +18,14 @@ from transformers import (
 from transformers.modeling_outputs import SequenceClassifierOutput
 from src.utils import get_gpu_info
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
+from sklearn.model_selection import train_test_split
 import argparse
 import logging
 import warnings
 import wandb
 
+
+    
 wandb.init(project="semeval2613_train_baseline")
 warnings.filterwarnings("ignore")
 
@@ -43,15 +46,14 @@ class ContrastiveCodeBERT(RobertaPreTrainedModel):
         
         self.roberta = RobertaModel(config, add_pooling_layer=False)
         
-        # Projection head for contrastive learning
         self.projection_head = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.ReLU(),
+            nn.Dropout(p=0.3),
             nn.Linear(config.hidden_size, 256)
         )
         
-        # Classification head
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.dropout = nn.Dropout(0.3)
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
         
         self.post_init()
@@ -63,6 +65,7 @@ class ContrastiveCodeBERT(RobertaPreTrainedModel):
         token_type_ids=None,
         labels=None,
         return_dict=None,
+        **kwargs,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
@@ -73,10 +76,10 @@ class ContrastiveCodeBERT(RobertaPreTrainedModel):
             token_type_ids=token_type_ids,
         )
         
-        # Use [CLS] token representation
+        # CLS token
         sequence_output = outputs[0][:, 0, :]
         
-        # Classification
+        # Classification head
         pooled_output = self.dropout(sequence_output)
         logits = self.classifier(pooled_output)
         
@@ -180,20 +183,25 @@ class CodeBERTTrainer:
 
             num_label0 = (df['label'] == 0).sum()
             print(f"Original label-0 count: {num_label0}")
-            keep_count = num_label0 // 2
+            # keep_count = int(num_label0 // 2
             df_label0 = df[df['label'] == 0]
-            df_label0_down = df_label0.sample(n=keep_count, random_state=42)
+            df_label0_down = df_label0.sample(frac=0.05, random_state=42)
             df_other = df[df['label'] != 0]
             df = pd.concat([df_other, df_label0_down], ignore_index=True)
+
+            # df = undersample(df)
             df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+            
 
             logger.info(f"Number of unique labels: {self.num_labels}")
             logger.info(f"Label range: {df['label'].min()} to {df['label'].max()}")
             logger.info(f"Label distribution:\n{df['label'].value_counts().sort_index()}")
 
-            train_size = int(0.8 * len(df))
-            train_df = df[:train_size].reset_index(drop=True)
-            val_df = df[train_size:].reset_index(drop=True)
+            # train_size = int(0.8 * len(df))
+            # train_df = df[:train_size].reset_index(drop=True)
+            # val_df = df[train_size:].reset_index(drop=True)
+            train_df, val_df = train_test_split(df, test_size=0.05, stratify=df["label"])
+
 
             logger.info(f"Train samples: {len(train_df)}, Validation samples: {len(val_df)}")
             return train_df, val_df
@@ -265,7 +273,7 @@ class CodeBERTTrainer:
 
         accuracy = accuracy_score(labels, predictions)
         precision, recall, f1, _ = precision_recall_fscore_support(
-            labels, predictions, average='weighted'
+            labels, predictions, average='macro'
         )
 
         metrics = {
@@ -315,16 +323,16 @@ class CodeBERTTrainer:
             logging_dir='./logs',
             logging_steps=100,
             eval_strategy="steps",
-            eval_steps=500,
+            eval_steps=1000,
             save_strategy="steps",
-            save_steps=500,
+            save_steps=1000,
             load_best_model_at_end=True,
             metric_for_best_model="f1",
             greater_is_better=True,
             remove_unused_columns=False,
             learning_rate=learning_rate,
             lr_scheduler_type="linear",
-            save_total_limit=2,
+            save_total_limit=1,
             dataloader_num_workers=dataloader_num_workers,     
             dataloader_pin_memory=True,                        
             dataloader_persistent_workers=True,

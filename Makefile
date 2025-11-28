@@ -40,11 +40,12 @@ train-contrastive-B:
 		run.slurm src.train_contrastive \
 		--model_name microsoft/unixcoder-base \
 		--task B \
-		--output_dir outputs/contrastive \
-		--epochs 1 \
-		--batch_size 64 \
-		--learning_rate 2e-5 \
-		--max_length 512 | awk '{print $$4}'); \
+		--output_dir outputs/contrastive_point9 \
+		--epochs 4 \
+		--batch_size 16 \
+		--learning_rate 5e-5 \
+		--max_length 512\
+        --contrastive_weight 0.9 | awk '{print $$4}'); \
 	echo "Submitted batch job $$jobid"; \
 	logfile=logs/train-contrastive_$${jobid}.out; \
 	echo "Tailing $$logfile..."; \
@@ -80,6 +81,21 @@ predict-baseline:
 		--max_length 512 | awk '{print $$4}'); \
 	echo "Submitted batch job $$jobid"; \
 	logfile=logs/predict-baseline_$${jobid}.out; \
+	echo "Tailing $$logfile..."; \
+	while [ ! -f $$logfile ]; do sleep 1; done; \
+	tail -f $$logfile
+
+predict-contrastive:
+	@jobid=$$(sbatch --job-name=predict-contrastive \
+		--output=logs/predict-contrastive_%j.out \
+		run.slurm src.predict_contrastive \
+		--model_path outputs/contrastive_point7 \
+		--parquet_path test.parquet \
+		--batch_size 256 \
+		--device cuda \
+		--max_length 512 | awk '{print $$4}'); \
+	echo "Submitted batch job $$jobid"; \
+	logfile=logs/predict-contrastive_$${jobid}.out; \
 	echo "Tailing $$logfile..."; \
 	while [ ! -f $$logfile ]; do sleep 1; done; \
 	tail -f $$logfile
